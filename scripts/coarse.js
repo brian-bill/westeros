@@ -7,8 +7,10 @@ import { S, COARSE_SCALE, setGrid } from './state.js';
 import { makeParamNoise, elevationAt, tempAt, moistAt } from './fields.js';
 import { fillDepressions, computeFlow } from './hydrology.js';
 import { placeSettlements } from './settlements.js';
+import { assignNames } from './names.js';
 
 const NB8 = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+const NB4 = [[1,0],[-1,0],[0,1],[0,-1]];
 
 export function generateCoarse(params){
   const { seed, sea, mtn, riverThresh, nSettle } = params;
@@ -33,6 +35,32 @@ export function generateCoarse(params){
   // baseline biome + rivers/lakes/swamps
   const isWater = new Uint8Array(N);
   for(let i=0;i<N;i++) biome[i] = classifyBiome(elev[i], temp[i], moist[i], sea, mtn);
+
+  // Open waters vs inland lakes: below-sea cells flood-filled from the map
+  // border are true open ocean; enclosed below-sea basins cut off from the sea
+  // become lakes instead of phantom landlocked oceans.
+  const openWater = new Uint8Array(N);
+  const stack = [];
+  for(let x=0;x<GW;x++) for(const y of [0,GH-1]){
+    const i=y*GW+x;
+    if((biome[i]===B.OCEAN||biome[i]===B.DEEP_OCEAN) && !openWater[i]){ openWater[i]=1; stack.push(i); }
+  }
+  for(let y=0;y<GH;y++) for(const x of [0,GW-1]){
+    const i=y*GW+x;
+    if((biome[i]===B.OCEAN||biome[i]===B.DEEP_OCEAN) && !openWater[i]){ openWater[i]=1; stack.push(i); }
+  }
+  while(stack.length){
+    const i=stack.pop(), px=i%GW, py=(i/GW)|0;
+    for(const [dx,dy] of NB4){
+      const nx=px+dx, ny=py+dy;
+      if(nx<0||ny<0||nx>=GW||ny>=GH) continue;
+      const j=ny*GW+nx;
+      if(!openWater[j] && (biome[j]===B.OCEAN||biome[j]===B.DEEP_OCEAN)){ openWater[j]=1; stack.push(j); }
+    }
+  }
+  for(let i=0;i<N;i++)
+    if(!openWater[i] && (biome[i]===B.OCEAN||biome[i]===B.DEEP_OCEAN)) biome[i]=B.LAKE;
+
   for(let i=0;i<N;i++){
     if(elev[i]<sea){ isWater[i]=1; continue; }
     if(accum[i]>riverThresh){ biome[i]=B.RIVER; isWater[i]=1; }
@@ -50,5 +78,6 @@ export function generateCoarse(params){
               settlements:[], GW, GH };
 
   placeSettlements(nSettle, sea);
+  assignNames();   // settlement + region names for the labels layer
   return S.world;
 }

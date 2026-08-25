@@ -81,7 +81,12 @@ export function refineFineBiome(fx, fy){
   e = Math.max(0, Math.min(1, e));
   const t = sampleCoarse(S.world.temp, fx, fy);
   const m = sampleCoarse(S.world.moist, fx, fy);
-  if(e < sea) return { b:(e < sea-0.06 ? B.DEEP_OCEAN : B.OCEAN), e };
+  if(e < sea){
+    // enclosed basins were relabeled LAKE on the coarse grid — keep the fine
+    // pass consistent so landlocked water renders as a lake, not an ocean
+    if(coarseBiomeAt(fx,fy)===B.LAKE) return { b:B.LAKE, e };
+    return { b:(e < sea-0.06 ? B.DEEP_OCEAN : B.OCEAN), e };
+  }
   const riv = fineRiverAt(fx, fy); if(riv >= 0) return { b:riv, e };
   let b = classifyBiome(e, t, m, sea, mtn);
   if(coarseBiomeAt(fx,fy)===B.SWAMP && e < sea+0.10) b = B.SWAMP;

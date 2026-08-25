@@ -1,11 +1,16 @@
 // Settlement placement on the coarse grid: suitability scoring + Poisson-disk-ish
 // greedy placement. Tiers (village/town/city) are assigned later in roads.js once
-// road connectivity is known.
+// road connectivity is known; placement predicts a tier from score rank so that
+// separation can be enforced per tier in METRIC units (see M_PER_FINE).
 
 import { B } from './biomes.js';
-import { S, COARSE_SCALE } from './state.js';
-
+import { S, COARSE_SCALE, fineToKm, kmToFine } from './state.js';
 const NB8 = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+
+// Minimum pairwise separation in km (metric via M_PER_FINE): any two URBAN
+// places (town/city) keep >= 50 km apart; rural villages may cluster much
+// closer (7 km), including around towns, as real settlements do.
+export const MIN_SEP_KM = { rural:7, urban:50 };
 
 export function placeSettlements(nSettle, sea){
   const { biome, elev } = S.world;
@@ -35,17 +40,35 @@ export function placeSettlements(nSettle, sea){
     score[i] = flat*0.35 + water*0.35 + fertile*0.25 + coast*0.2;
   }
 
-  // greedy placement with minimum spacing
+  // greedy placement with tier-aware minimum spacing (in km). The k-th best
+  // SITE is predicted to become city/town/village with the same Zipf shares
+  // roads.js later uses. Two predicted-urban sites need MIN_SEP_KM.urban (50
+  // km); everything else just keeps rural elbow room (7 km). Prediction
+  // follows candidate rank, so rejected sites can't stall lower tiers.
   const cand = [...Array(N).keys()].filter(i=>score[i]>0.35).sort((a,b)=>score[b]-score[a]);
-  const minDist = Math.max(3, Math.round(GW/40));
+  const worldKm = fineToKm(GW*COARSE_SCALE);
+  const clampKm = km => Math.min(km, worldKm*0.45);   // tiny worlds: scale down
+  const sepRural = kmToFine(clampKm(MIN_SEP_KM.rural));
+  const sepUrban = kmToFine(clampKm(MIN_SEP_KM.urban));
+  const nCity = Math.max(1, Math.round(nSettle*0.10));
+  const nTown = Math.round(nSettle*0.25);
+  let rank = -1;
   for(const i of cand){
     if(settlements.length>=nSettle) break;
-    const px=i%GW, py=(i/GW)|0; let ok=true;
-    for(const s of settlements){ if(Math.hypot(s.cx-px,s.cy-py)<minDist){ ok=false; break; } }
+    rank++;
+    const px=i%GW, py=(i/GW)|0;
+    const fx=(px+0.5)*COARSE_SCALE, fy=(py+0.5)*COARSE_SCALE;   // fine coords
+    const predTier = rank<nCity ? 2 : rank<nCity+nTown ? 1 : 0;
+    let ok=true;
+    for(const s of settlements){
+      const need = (predTier>=1 && s.ptier>=1) ? sepUrban : sepRural;
+      if(Math.hypot(s.x-fx, s.y-fy) < need){ ok=false; break; }   // fine-space dist
+    }
     if(ok) settlements.push({
       cx:px, cy:py,                                       // coarse coords
       x:(px+0.5)*COARSE_SCALE, y:(py+0.5)*COARSE_SCALE,   // fine world coords
-      score:score[i], tier:0, degree:0, buildings:null, streets:null, R:0
+      score:score[i], tier:0, degree:0, buildings:null, streets:null, R:0,
+      ptier:predTier,                                     // predicted tier at placement
     });
   }
 }
