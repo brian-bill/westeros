@@ -73,7 +73,8 @@ The pipeline is a sequence of passes, each reading previous layers.
 
 ### Rendering & UI
 - [x] Canvas 2D with cached offscreen chunk bitmaps
-- [x] Pan / zoom / hover inspection tooltip
+- [x] Pan / zoom / hover inspection tooltip — full desktop + mobile parity
+      (drag to pan, scroll or pinch to zoom, tap to inspect)
 - [x] Controls: seed, sea level, mountain level, river density, settlement count, world size
 - [x] Layer toggles + biome legend + live stats
 

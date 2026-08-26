@@ -68,25 +68,107 @@ function fit(){
 }
 
 //--------------------------------------------------------------------------
-// Interaction: pan / zoom / hover
+// Interaction: pan / zoom / hover — unified Pointer Events so touch gets full
+// parity with the mouse: one finger drags to pan, two fingers pinch to zoom,
+// a quick tap inspects like a hover. (Canvas has `touch-action: none`.)
 //--------------------------------------------------------------------------
-let dragging=false, last={x:0,y:0};
-canvas.addEventListener('mousedown', e=>{ dragging=true; last={x:e.clientX,y:e.clientY}; canvas.classList.add('dragging'); });
-window.addEventListener('mouseup', ()=>{ dragging=false; canvas.classList.remove('dragging'); });
-window.addEventListener('mousemove', e=>{
-  if(dragging){ S.view.x += e.clientX-last.x; S.view.y += e.clientY-last.y;
-    last={x:e.clientX,y:e.clientY}; draw(); }
-  updateTip(e);
+const pointers = new Map();      // pointerId -> [x,y] canvas-relative
+let panning = false, last = [0, 0];
+let pinch = null;                // { dist, x, y } mid-point anchor while zooming
+let tapStart = null;             // { t, x, y } for tap-vs-drag discrimination
+const TAP_MS = 350, TAP_SLOP = 8;
+
+const relPt = e => {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX-r.left, e.clientY-r.top];
+};
+const pinchSpan = () => {
+  const [[ax,ay],[bx,by]] = [...pointers.values()];
+  return Math.hypot(ax-bx, ay-by);
+};
+const pinchMid = () => {
+  const [[ax,ay],[bx,by]] = [...pointers.values()];
+  return [(ax+bx)/2, (ay+by)/2];
+};
+
+function zoomAt(mx, my, f){
+  const [wx,wy] = screenToWorld(mx,my);
+  S.view.scale = Math.max(0.08, Math.min(30, S.view.scale*f));
+  S.view.x = mx - wx*S.view.scale; S.view.y = my - wy*S.view.scale;
+  draw();
+}
+
+canvas.addEventListener('pointerdown', e=>{
+  canvas.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, relPt(e));
+  if(pointers.size === 1){
+    panning = true; last = relPt(e);
+    tapStart = { t: performance.now(), x: last[0], y: last[1] };
+    canvas.classList.add('dragging');
+  } else if(pointers.size === 2){
+    panning = false;                       // second finger: switch to pinch
+    tapStart = null;
+    const [x,y] = pinchMid();
+    pinch = { dist: pinchSpan(), x, y };
+  }
 });
+
+canvas.addEventListener('pointermove', e=>{
+  const pt = relPt(e);
+  if(!pointers.has(e.pointerId)){ if(e.pointerType==='mouse') updateTip(e); return; }
+  pointers.set(e.pointerId, pt);
+  if(pinch && pointers.size >= 2){
+    // pan follows the midpoint, zoom anchors the world point under it
+    const [mx,my] = pinchMid();
+    S.view.x += mx-pinch.x; S.view.y += my-pinch.y;
+    zoomAt(mx, my, pinchSpan()/pinch.dist);
+    pinch = { dist: pinchSpan(), x: mx, y: my };
+  } else if(panning && pointers.size === 1){
+    S.view.x += pt[0]-last[0]; S.view.y += pt[1]-last[1];
+    last = pt; draw();
+  }
+  if(e.pointerType==='mouse') updateTip(e);
+});
+
+function releasePointer(e){
+  pointers.delete(e.pointerId);
+  const remaining = [...pointers.values()];
+  if(pinch && remaining.length < 2) pinch = null;
+  // lifting one finger of a pinch hands control back to the other
+  if(remaining.length === 1){ panning = true; last = remaining[0]; }
+  if(remaining.length === 0){
+    panning = false;
+    canvas.classList.remove('dragging');
+    if(tapStart && e.type === 'pointerup'){
+      const pt = relPt(e);
+      const dx = pt[0]-tapStart.x, dy = pt[1]-tapStart.y;
+      if(performance.now()-tapStart.t < TAP_MS && Math.hypot(dx,dy) < TAP_SLOP)
+        showTapTip(e);                        // a tap acts as a transient hover
+    }
+    tapStart = null;
+  }
+}
+canvas.addEventListener('pointerup', releasePointer);
+canvas.addEventListener('pointercancel', releasePointer);
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+
+// Touch has no persistent hover: show the inspection tooltip on tap, then fade
+const tip = $('tip');
+let tipTimer = 0;
+function showTapTip(e){
+  updateTip(e);
+  tip.classList.remove('fade');
+  clearTimeout(tipTimer);
+  tipTimer = setTimeout(()=>tip.classList.add('fade'), 4000);
+}
+
 canvas.addEventListener('wheel', e=>{
   e.preventDefault();
   const r = canvas.getBoundingClientRect(); const mx=e.clientX-r.left, my=e.clientY-r.top;
-  const [wx,wy] = screenToWorld(mx,my); const f = e.deltaY<0 ? 1.12 : 1/1.12;
-  S.view.scale = Math.max(0.08, Math.min(30, S.view.scale*f));
-  S.view.x = mx - wx*S.view.scale; S.view.y = my - wy*S.view.scale; draw();
+  const f = e.deltaY<0 ? 1.12 : 1/1.12;
+  zoomAt(mx, my, f);
 }, { passive:false });
 
-const tip = $('tip');
 const TIER_NAME = ['village','town','city'];
 function updateTip(e){
   if(!S.world) return;
@@ -138,21 +220,8 @@ $('rnd').addEventListener('click', ()=>{ $('seed').value = Math.random().toStrin
 window.addEventListener('resize', draw);
 
 //--------------------------------------------------------------------------
-// Small-screen UX: advisory modal + collapsible panel
+// Small-screen UX: collapsible panel (button shown via CSS media query)
 //--------------------------------------------------------------------------
-const MOBILE_MQ = window.matchMedia('(max-width: 720px)');
-
-// Dismissible "use desktop" notice — remembered for the session.
-const notice = $('mobileNotice');
-if(MOBILE_MQ.matches && !sessionStorage.getItem('mobileNoticeDismissed')){
-  notice.hidden = false;
-}
-$('mobileNoticeDismiss').addEventListener('click', ()=>{
-  notice.hidden = true;
-  sessionStorage.setItem('mobileNoticeDismissed', '1');
-});
-
-// Collapsible panel toggle (visible only on small screens via CSS).
 const panel = $('panel');
 const panelToggle = $('panelToggle');
 panelToggle.addEventListener('click', ()=>{

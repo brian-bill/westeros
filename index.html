@@ -3,9 +3,9 @@
 
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 
-  <title>Westeros — Procedurally Generated 2D World Map Explorer</title>
+  <title>Westeros</title>
   <meta name="description"
     content="Explore infinite, procedurally generated 2D fantasy worlds. A seeded, two-tier chunked map engine rendering continents, biomes, rivers, roads, and living settlements on the HTML Canvas — pan, zoom, and share any world by seed." />
   <meta name="keywords"
@@ -81,8 +81,8 @@
     <div id="panel">
       <div>
         <h1>Westeros</h1>
-        <div class="sub">Two-tier chunked world: coarse global skeleton + on-demand fine chunks. Drag to pan, scroll to
-          zoom.</div>
+        <div class="sub">Two-tier chunked world: coarse global skeleton + on-demand fine chunks. Drag to pan, scroll
+          or pinch to zoom.</div>
       </div>
       <details class="accordion accordion-grow" name="panel" open>
         <summary>Controls</summary>
@@ -128,17 +128,6 @@
         </div>
       </details>
       <div id="stat"></div>
-    </div>
-  </div>
-
-  <div id="mobileNotice" hidden>
-    <div class="mobile-notice-card" role="dialog" aria-modal="true" aria-labelledby="mnTitle"
-      aria-describedby="mnBody">
-      <h2 id="mnTitle">Best on desktop</h2>
-      <p id="mnBody">Westeros is a heavy procedural map engine. On small screens it may run slowly or feel
-        cramped. For the best experience — smooth panning, zooming and full controls — switch to a desktop or
-        larger screen.</p>
-      <button id="mobileNoticeDismiss">Continue anyway</button>
     </div>
   </div>
 

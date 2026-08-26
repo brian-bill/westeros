@@ -51,6 +51,13 @@ canvas {
     height: 100%;
     cursor: grab;
     image-rendering: pixelated;
+    /* All gestures on the canvas belong to the map: one finger pans, two
+       pinch-zoom. Without this the browser would hijack touches for page
+       scroll/zoom and pointer events would be cancelled mid-gesture. */
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
 }
 
 canvas.dragging {
@@ -61,7 +68,12 @@ canvas.dragging {
     width: 280px;
     background: var(--panel);
     padding: 16px;
+    /* Single scroll container for the whole panel — controls, legend and stats
+       all stay reachable by scrolling here. Nested per-accordion scrolling
+       proved unreliable across browsers (details/flex sizing quirks). */
     overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
     border-left: 1px solid #000;
     display: flex;
     flex-direction: column;
@@ -71,6 +83,13 @@ canvas.dragging {
     bottom: 10px;
     right: 10px;
     border-radius: 12px;
+}
+
+/* Children must never flex-shrink: with overflow:hidden their automatic
+   minimum size collapses to 0, so flex would silently squeeze (clip) content
+   into place instead of letting the panel grow a scrollbar. */
+#panel > * {
+    flex: 0 0 auto;
 }
 
 h1 {
@@ -181,6 +200,12 @@ button:hover {
     pointer-events: none;
     white-space: pre;
     line-height: 1.4;
+    transition: opacity .3s ease;
+}
+
+/* Touch taps show the tooltip transiently (there is no hover on mobile) */
+#tip.fade {
+    opacity: 0;
 }
 
 #stat {
@@ -194,18 +219,15 @@ hr {
     margin: 2px 0;
 }
 
+/* Accordions size naturally and flow inside the panel's single scroller.
+   NOTE: deliberately NOT display:flex on <details> — browsers wrap non-summary
+   children in an anonymous box that breaks flex sizing and silently clips
+   content (the "can't scroll the controls" bug). */
 .accordion {
     border: 1px solid #30363d;
     border-radius: 8px;
     background: #0d1117;
     overflow: hidden;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-}
-
-.accordion-grow[open] {
-    flex: 1 1 auto;
 }
 
 .accordion>summary {
@@ -219,7 +241,6 @@ hr {
     align-items: center;
     justify-content: space-between;
     user-select: none;
-    flex: 0 0 auto;
 }
 
 .accordion>summary::-webkit-details-marker {
@@ -246,8 +267,6 @@ hr {
     gap: 14px;
     padding: 12px;
     border-top: 1px solid #30363d;
-    overflow-y: auto;
-    min-height: 0;
 }
 
 /* Panel toggle button (hidden on desktop, shown on small screens) */
@@ -264,59 +283,27 @@ hr {
     display: none;
 }
 
-/* Mobile advisory modal */
-#mobileNotice {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-    background: rgba(0, 0, 0, .7);
-}
-
-#mobileNotice[hidden] {
-    display: none;
-}
-
-.mobile-notice-card {
-    background: var(--panel);
-    border: 1px solid #30363d;
-    border-radius: 12px;
-    padding: 20px;
-    max-width: 340px;
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-}
-
-.mobile-notice-card h2 {
-    margin: 0;
-    font-size: 16px;
-}
-
-.mobile-notice-card p {
-    margin: 0;
-    color: var(--muted);
-    font-size: 12px;
-    line-height: 1.6;
-}
-
 /* Small screens: panel becomes a collapsible bottom sheet */
 @media (max-width: 720px) {
     #panelToggle {
         display: block;
+        top: calc(10px + env(safe-area-inset-top, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+    }
+
+    #tip {
+        top: calc(10px + env(safe-area-inset-top, 0px));
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        max-width: calc(100% - 130px);
     }
 
     #panel {
         top: auto;
-        left: 10px;
-        right: 10px;
-        bottom: 10px;
+        left: calc(10px + env(safe-area-inset-left, 0px));
+        right: calc(10px + env(safe-area-inset-right, 0px));
+        bottom: calc(10px + env(safe-area-inset-bottom, 0px));
         width: auto;
-        max-height: 70vh;
+        max-height: min(75vh, 640px);
         transform: translateY(calc(100% + 20px));
         transition: transform .25s ease;
         box-shadow: 0 -8px 30px rgba(0, 0, 0, .5);

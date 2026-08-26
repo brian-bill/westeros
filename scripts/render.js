@@ -17,7 +17,9 @@ export function screenToWorld(sx, sy){
 }
 
 export function draw(){
-  const dpr = window.devicePixelRatio || 1;
+  // Cap the backing-store ratio at 2: phones reporting 3x gain nothing visible
+  // but pay heavily in fragment-fill cost on every frame.
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const cw = canvas.clientWidth, ch = canvas.clientHeight;
   // Only resize the backing store when it actually changes: assigning width/height
   // clears the whole canvas, and doing it every frame causes visible flicker.
