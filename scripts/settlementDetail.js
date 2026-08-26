@@ -7,7 +7,7 @@
 import { xmur3, mulberry32 } from './rng.js';
 import { S, COARSE_SCALE } from './state.js';
 import { B } from './biomes.js';
-import { refineFineBiome } from './fields.js';
+import { refineFineBiome } from './worldTiles.js';
 
 const isWaterBiome = b => b===B.OCEAN || b===B.DEEP_OCEAN || b===B.RIVER
                        || b===B.LAKE  || b===B.SWAMP;
@@ -41,7 +41,7 @@ function distSeg(px,py, ax,ay, bx,by){
 
 export function ensureSettlementDetail(s){
   if(s.buildings) return;
-  const seedFn = xmur3(S.world.params.seed + '::layout::' + s.cx + ':' + s.cy);
+  const seedFn = xmur3(S.params.seed + '::layout::' + s.cx + ':' + s.cy);
   const rand = mulberry32(seedFn());
 
   // Footprint radius, capped by roads.js so built-up areas never overlap.
@@ -68,9 +68,10 @@ export function ensureSettlementDetail(s){
   const ROAD_CLEAR = 1.8;   // world units kept free either side of a road line
   const corridors = [];
   for(const e of (S.world.roads?.edges)||[]){
-    const pts = e.path.map(ci=>[
-      ((ci%S.GW)+0.5)*COARSE_SCALE,
-      (((ci/S.GW)|0)+0.5)*COARSE_SCALE ]);
+    if(!e.path) continue;
+    const pts = e.path.map(([gx,gy])=>[
+      (gx+0.5)*COARSE_SCALE,
+      (gy+0.5)*COARSE_SCALE ]);
     if(pts.some(([px,py]) => Math.abs(px-s.x)<R+8 && Math.abs(py-s.y)<R+8))
       corridors.push(pts);
   }

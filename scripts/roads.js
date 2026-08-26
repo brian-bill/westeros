@@ -1,17 +1,22 @@
-// Road network on the coarse grid with a two-class hierarchy:
-//   trunk highways — mesh the hub set (predicted towns/cities), drawn wide;
-//   feeder roads   — thin spurs joining every remaining settlement to the net.
-// Through-traffic skirts settlement cores (avoid mask), and a metric
-// demotion pass guarantees tier>=1 settlements stay >= SEP_KM[1] apart.
-// Also builds the junction graph for agent routing.
+// Road network, built incrementally as the infinite world streams in.
+//
+// The finite world meshed hubs with one global A* tournament; infinity uses
+// nearest-neighbor wiring, which is deterministic and purely local:
+//   trunks  — every town/city links to its 3 nearest urban places
+//   feeders — every village links to its 2 nearest settlements of any tier
+// Edges are canonical (sorted endpoint ids) and deduped, so both endpoints'
+// tiles proposing the same link collapse into one. Paths are laid lazily by
+// windowed A* once the corridor's tiles have streamed; through-routes skirt
+// settlement cores, feeders avoid trunk corridors, and bridges get siderails
+// wherever the alignment crosses painted water. Also maintains the junction
+// graph (vehicles), feeder subgraph (hikers) and roundabouts.
 
 import { B } from './biomes.js';
-import { S, COARSE_SCALE, kmToFine } from './state.js';
-import { MIN_SEP_KM } from './settlements.js';
-import { gridAstar } from './navigation.js';
+import { S, COARSE_SCALE } from './state.js';
+import { biomeCell, routeCoarse } from './navigation.js';
+import { settlementsNear } from './settlements.js';
 
-function coarseMoveCost(i){
-  const b = S.world.biome[i];
+function moveCost(b){
   if(b===B.OCEAN||b===B.DEEP_OCEAN) return Infinity;
   // moderate cost: roads cross rivers/lakes with a proper bridge rather than
   // detouring absurdly along the bank (bridges get siderails at render time)
@@ -23,221 +28,152 @@ function coarseMoveCost(i){
   return 1;
 }
 
-export function buildRoads(){
-  const S_ = S.world.settlements; const GW = S.GW, GH = S.GH;
-  const roadSet = new Set(); const trunkSet = new Set(); const edges = [];
-  S.world.roads = { roadSet, edges };
-  if(S_.length < 2){ S.world.roadGraph = { nodes:[], adj:new Map() }; return; }
-  const N = S_.length;
-
-  // ---- predicted hierarchy (same Zipf shares as the final tiering below):
-  // top ~10% of sites are city candidates, next ~25% towns, rest villages.
-  const order = [...S_.keys()].sort((a,b)=>S_[b].score-S_[a].score);
-  const est = new Int8Array(N);
-  const nCity = Math.max(1, Math.round(N*0.10)), nTown = Math.round(N*0.25);
-  order.forEach((si,idx)=>{ est[si] = idx<nCity ? 2 : idx<nCity+nTown ? 1 : 0; });
-
-  // cells inside settlement cores that through-roads should route around
-  // (endpoints are exempt, so a settlement's own spur still reaches it)
-  const avoid = new Uint8Array(GW*GH);
-  for(let i=0;i<N;i++){
-    const s=S_[i], r=Math.max(2, Math.round([3.5,6,10][est[i]]*0.30));
-    for(let y=Math.max(0,s.cy-r); y<=Math.min(GH-1,s.cy+r); y++)
-      for(let x=Math.max(0,s.cx-r); x<=Math.min(GW-1,s.cx+r); x++)
-        if((x-s.cx)*(x-s.cx)+(y-s.cy)*(y-s.cy) <= r*r) avoid[y*GW+x]=1;
+// Propose an edge to each of s's nearest neighbors. Cheap (no paths yet);
+// runs once per settlement at registration and whenever new candidates appear.
+export function tryLinkSettlement(s){
+  const urban = s.tier >= 1;
+  const R = urban ? 220 : 36;                       // reach, coarse cells
+  const K = urban ? 3 : 2;
+  const near = settlementsNear(s.cx, s.cy, R, o => o !== s);
+  let linked = 0;
+  for(const o of near){
+    if(linked >= K) break;
+    if(urban && o.tier === 0) continue;             // trunks join urban places
+    const key = Math.min(s.idx,o.idx) + ':' + Math.max(s.idx,o.idx);
+    if(S.world.roads.edgeKeys.has(key)){ linked++; continue; }
+    S.world.roads.edgeKeys.add(key);
+    const edge = {
+      key,
+      a: Math.min(s.idx,o.idx), b: Math.max(s.idx,o.idx),
+      cls: urban && o.tier >= 1 ? 'trunk' : 'feeder',
+      path: null, bridges: []
+    };
+    S.world.roads.edges.push(edge);
+    S.world.roads.edgeByKey.set(key, edge);
+    linked++;
   }
+}
 
-  const parent = [...Array(N).keys()];
-  const find = i => { while(parent[i]!==i){ parent[i]=parent[parent[i]]; i=parent[i]; } return i; };
-  const uni = (a,b)=>{ a=find(a); b=find(b); if(a!==b){ parent[a]=b; return true; } return false; };
-
-  const link = (a,b,phase)=>{
-    const startI=S_[a].cy*GW+S_[a].cx, goalI=S_[b].cy*GW+S_[b].cx;
-    const path = gridAstar(startI, goalI, j=>{
-      const base=coarseMoveCost(j); if(!isFinite(base)) return Infinity;
-      let c=base;
-      if(roadSet.has(j)) c*= phase==='highway' ? 0.3 : 0.35;
-      // spurs keep their own alignment instead of running down a highway
-      // corridor — pedestrians walk these roads and must not end up on trunks
-      if(phase==='spur' && trunkSet.has(j)) c*=6;
-      if(avoid[j] && j!==startI && j!==goalI) c*=8;   // skirt town cores
-      return c;
-    });
-    if(!path) return false;
-    for(const p of path) roadSet.add(p);
-    if(phase==='highway') for(const p of path) trunkSet.add(p);
-    edges.push({ a, b, path, phase });
-    S_[a].degree++; S_[b].degree++;
-    uni(a,b);
-    return true;
-  };
-
-  // ---- highways: mesh the hub set (K nearest hub neighbors), shorter first,
-  // reusing existing roads at a discount so trunk routes emerge.
-  const hubs = order.slice(0, nCity+nTown);
-  const pairs = [];
-  for(const a of hubs){
-    hubs.map(b=>({ b, d:Math.hypot(S_[b].cx-S_[a].cx, S_[b].cy-S_[a].cy) }))
-      .filter(o=>o.b!==a).sort((p,q)=>p.d-q.d).slice(0,3)
-      .forEach(({b})=>{ if(b>a) pairs.push([a,b]); });
+// Cells inside settlement cores that through-roads should route around.
+// Built fresh per path search over the search window only.
+function buildCoreAvoid(x0,y0,x1,y1){
+  const avoid = new Set();
+  for(const s of settlementsNear(((x0+x1)/2)|0, ((y0+y1)/2)|0,
+                                 Math.hypot(x1-x0,y1-y0)/2 + 12, () => true)){
+    const r = Math.max(2, Math.round([3.5,6,10][s.tier]*0.30));
+    for(let y=Math.max(y0,s.cy-r); y<=Math.min(y1,s.cy+r); y++)
+      for(let x=Math.max(x0,s.cx-r); x<=Math.min(x1,s.cx+r); x++)
+        if((x-s.cx)*(x-s.cx)+(y-s.cy)*(y-s.cy) <= r*r) avoid.add(x+','+y);
   }
-  pairs.sort((e1,e2)=>Math.hypot(S_[e1[0]].cx-S_[e1[1]].cx, S_[e1[0]].cy-S_[e1[1]].cy)
-                    - Math.hypot(S_[e2[0]].cx-S_[e2[1]].cx, S_[e2[0]].cy-S_[e2[1]].cy));
-  for(const [a,b] of pairs) link(a, b, 'highway');
+  return avoid;
+}
 
-  // stitch any separate highway components together (closest rep pair first)
-  for(let guard=N*4; guard-->0;){
-    const reps = new Map();
-    for(const i of hubs) reps.set(find(i), i);
-    if(reps.size<=1) break;
-    let ba=-1, bb=-1, bd=Infinity;
-    for(const a of reps.values()) for(const b of reps.values()){
-      if(find(a)===find(b)) continue;
-      const d=Math.hypot(S_[a].cx-S_[b].cx, S_[a].cy-S_[b].cy);
-      if(d<bd){ bd=d; ba=a; bb=b; }
-    }
-    if(ba<0 || !link(ba,bb,'highway')) break;
-  }
-  const netRoot = find(hubs[0]);
-
-  // ---- feeders: every settlement not yet on the net joins at the nearest
-  // connected node — one thin spur per village instead of a redundant mesh.
-  const failed = new Set();
-  for(const si of order){
-    if(find(si)===netRoot || failed.has(si)) continue;
-    let bj=-1, bd=Infinity;
-    for(let j=0;j<N;j++){
-      if(j===si || failed.has(j) || find(j)!==netRoot) continue;
-      const d=Math.hypot(S_[j].cx-S_[si].cx, S_[j].cy-S_[si].cy);
-      if(d<bd){ bd=d; bj=j; }
-    }
-    if(bj<0 || !link(si,bj,'spur')) failed.add(si);
-  }
-
-  // ---- rank-size (Zipf-ish) tier distribution from realized centrality
-  const ranked = S_.map(s=>({ s, r:s.degree + s.score*4 })).sort((a,b)=>b.r-a.r);
-  const fCity = Math.max(ranked.length?1:0, Math.round(ranked.length*0.10));
-  const fTown = Math.round(ranked.length*0.25);
-  ranked.forEach((o,idx)=>{ o.s.tier = idx<fCity ? 2 : idx<fCity+fTown ? 1 : 0; });
-
-  // ---- metric rule: keep tier>=1 places >= MIN_SEP_KM.urban (50 km) apart by
-  // demoting clashing lower-ranked towns back to villages.
-  const minSep = kmToFine(MIN_SEP_KM.urban);
-  const kept = [];
-  for(const o of ranked){
-    const s=o.s; if(s.tier<1) continue;
-    let clash=false;
-    for(const k of kept) if(Math.hypot(s.x-k.x, s.y-k.y) < minSep){ clash=true; break; }
-    if(clash) s.tier=0; else kept.push(s);
-  }
-
-  // classify roads: anything built as part of the highway mesh stays a trunk
-  // even if an endpoint was later demoted (it's still a major regional route);
-  // village spurs are feeders.
-  for(const e of edges)
-    e.cls = e.phase === 'highway' ? 'trunk' : 'feeder';
-
-  // ---- bridges: siderails go wherever a road passes over PAINTED water.
-  // A* can slip diagonally between two wet cells without touching either, and
-  // fine rendering widens rivers beyond their coarse cells, so cell membership
-  // is not enough — sample the polyline finely against the same water discs
-  // the renderer paints (river ~.28 / lake ~.7 of a coarse cell wide).
+// Bridges: siderails go wherever a road passes over PAINTED water. A* can
+// slip diagonally between two wet cells without touching either, and fine
+// rendering widens rivers beyond their coarse cells, so sample the polyline
+// finely against the same water discs the renderer paints.
+function computeBridges(edge){
   const wetAt = (x,y)=>{
     const gx=Math.round(x/COARSE_SCALE-0.5), gy=Math.round(y/COARSE_SCALE-0.5);
     for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
-      const cx=gx+dx, cy=gy+dy;
-      if(cx<0||cy<0||cx>=GW||cy>=GH) continue;
-      const b=S.world.biome[cy*GW+cx];
+      const b = biomeCell(gx+dx, gy+dy);
       if(b!==B.RIVER && b!==B.LAKE) continue;
-      const w = b===B.LAKE ? COARSE_SCALE*0.75 : COARSE_SCALE*0.34;
-      if(Math.hypot(x-(cx+0.5)*COARSE_SCALE, y-(cy+0.5)*COARSE_SCALE) < w) return true;
+      const w = b===B.LAKE ? COARSE_SCALE*0.75 : COARSE_SCALE*0.40;
+      if(Math.hypot(x-(gx+dx+0.5)*COARSE_SCALE, y-(gy+dy+0.5)*COARSE_SCALE) < w) return true;
     }
     return false;
   };
-  for(const e of edges){
-    e.bridges = [];
-    const pts = e.path.map(ci=>[((ci%GW)+0.5)*COARSE_SCALE, (((ci/GW)|0)+0.5)*COARSE_SCALE]);
-    let run = null;
-    for(let k=0;k<pts.length-1;k++){
-      const [ax,ay]=pts[k], [bx,by]=pts[k+1];
-      const len=Math.hypot(bx-ax,by-ay), n=Math.max(1,Math.ceil(len));
-      for(let j=0;j<=n;j++){
-        const t=j/n, x=ax+(bx-ax)*t, y=ay+(by-ay)*t;
-        if(wetAt(x,y)){ if(!run) run=[]; run.push([x,y]); }
-        else if(run){ e.bridges.push(run); run=null; }
-      }
+  const pts = edge.path.map(([gx,gy])=>[(gx+0.5)*COARSE_SCALE, (gy+0.5)*COARSE_SCALE]);
+  let run = null;
+  for(let k=0;k<pts.length-1;k++){
+    const [ax,ay]=pts[k], [bx,by]=pts[k+1];
+    const len=Math.hypot(bx-ax,by-ay), n=Math.max(1,Math.ceil(len));
+    for(let j=0;j<=n;j++){
+      const t=j/n, x=ax+(bx-ax)*t, y=ay+(by-ay)*t;
+      if(wetAt(x,y)){ if(!run) run=[]; run.push([x,y]); }
+      else if(run){ edge.bridges.push(run); run=null; }
     }
-    if(run) e.bridges.push(run);
   }
-
-  markRoundabouts();
-
-  // Cap built-up footprints (s.maxR) so neighboring settlements never overlap:
-  // cities claim their full radius first, then smaller places shrink to fit the
-  // gap. ensureSettlementDetail() consumes maxR when laying out streets/lots.
-  const BASE_R = [3.5,6,10].map(r=>r*COARSE_SCALE*0.5);
-  const MARGIN = 3;
-  const byRank = [...S_].sort((a,b)=> b.tier-a.tier || b.score-a.score);
-  const placedCircles = [];
-  for(const s of byRank){
-    let r = BASE_R[s.tier];
-    for(const p of placedCircles){
-      r = Math.min(r, Math.hypot(s.x-p.x, s.y-p.y) - p.r - MARGIN);
-    }
-    // 0 => too hemmed in for any buildings; only the marker is drawn
-    s.maxR = Math.max(0, r);
-    if(s.maxR > 0) placedCircles.push({ x:s.x, y:s.y, r:s.maxR });
-  }
-
-  buildRoadGraph();
-}
-
-export function buildRoadGraph(){
-  const S_ = S.world.settlements;
-  const nodes = S_.map((s,idx)=>({ idx, cx:s.cx, cy:s.cy, tier:s.tier }));
-  const adj = new Map(nodes.map(n=>[n.idx, []]));
-  for(const e of S.world.roads.edges){
-    const dist = e.path.length;
-    adj.get(e.a).push({ to:e.b, dist, path:e.path });
-    adj.get(e.b).push({ to:e.a, dist, path:[...e.path].reverse() });
-  }
-  S.world.roadGraph = { nodes, adj };
+  if(run) edge.bridges.push(run);
 }
 
 // ---- roundabouts -----------------------------------------------------------
 // Where two roads cross away from settlement junctions, plant a roundabout.
 // A crossing is a cell shared by two distinct edges whose local headings are
-// NOT parallel — merged stretches run in the same direction and need no circle.
-function markRoundabouts(){
-  const GW = S.GW;
-  const tangent = (path,k)=>{
-    const a=path[Math.max(0,k-1)], b=path[Math.min(path.length-1,k+1)];
-    const dx=(b%GW)-(a%GW), dy=((b/GW)|0)-((a/GW)|0), l=Math.hypot(dx,dy)||1;
-    return [dx/l, dy/l];
-  };
-  const at = new Map();   // interior cell -> [edgeIdx, pathIdx] passes
-  S.world.roads.edges.forEach((e,ei)=>{
-    for(let k=1;k<e.path.length-1;k++){
-      let l=at.get(e.path[k]); if(!l){ l=[]; at.set(e.path[k], l); }
-      l.push([ei,k]);
-    }
-  });
-  const pts = [];
-  for(const [ci,list] of at){
+// NOT parallel — merged stretches run in the same direction and need none.
+const cellPasses = new Map();   // "gx,gy" -> [[edgeKey, k]]
+const raSet = new Set();
+const tangent = (path,k)=>{
+  const a=path[Math.max(0,k-1)], b=path[Math.min(path.length-1,k+1)];
+  const dx=b[0]-a[0], dy=b[1]-a[1], l=Math.hypot(dx,dy)||1;
+  return [dx/l, dy/l];
+};
+function markRoundabouts(edge){
+  const byKey = S.world.roads.edgeByKey;
+  for(let k=1;k<edge.path.length-1;k++){
+    const [gx,gy]=edge.path[k], ck=gx+','+gy;
+    let list=cellPasses.get(ck); if(!list){ list=[]; cellPasses.set(ck,list); }
+    list.push([edge.key, k]);
     if(list.length<2) continue;
-    cross:
-    for(let i=0;i<list.length;i++) for(let j=i+1;j<list.length;j++){
-      const [ea,ka]=list[i], [eb,kb]=list[j];
-      if(ea===eb) continue;
-      const ua=tangent(S.world.roads.edges[ea].path, ka);
-      const ub=tangent(S.world.roads.edges[eb].path, kb);
-      // |dot| well below 1 means the headings genuinely diverge (a crossing)
-      if(Math.abs(ua[0]*ub[0]+ua[1]*ub[1]) < 0.85){
-        const x=((ci%GW)+0.5)*COARSE_SCALE, y=(((ci/GW)|0)+0.5)*COARSE_SCALE;
-        if(pts.every(p=>Math.hypot(p.x-x,p.y-y) > COARSE_SCALE*1.5)) pts.push({x,y});
-        break cross;
-      }
+    // compare only against the previous pass: enough to catch fresh crossings
+    const [ea,ka]=list[list.length-2], [eb,kb]=list[list.length-1];
+    if(ea===eb) continue;
+    const ea2=byKey.get(ea), eb2=byKey.get(eb);
+    if(!ea2||!eb2||!ea2.path||!eb2.path) continue;
+    const ua=tangent(ea2.path,ka), ub=tangent(eb2.path,kb);
+    if(Math.abs(ua[0]*ub[0]+ua[1]*ub[1]) >= 0.85) continue;   // parallel merge
+    const x=(gx+0.5)*COARSE_SCALE, y=(gy+0.5)*COARSE_SCALE;
+    if(S.world.roundabouts.every(p => Math.hypot(p.x-x,p.y-y) > COARSE_SCALE*1.5)){
+      S.world.roundabouts.push({x,y}); raSet.add(ck);
     }
   }
-  S.world.roundabouts = pts;
+}
+
+// Lay pending paths for edges near the viewport (coarse rect). Called each
+// frame; returns true when anything new was built (callers may redraw).
+export function ensureRoads(x0,y0,x1,y1){
+  let built = false;
+  for(const e of S.world.roads.edges){
+    if(e.path) continue;
+    const sa=S.world.settlements[e.a], sb=S.world.settlements[e.b];
+    if(!sa || !sb) continue;
+    const ex0=Math.min(sa.cx,sb.cx)-4, ex1=Math.max(sa.cx,sb.cx)+4;
+    const ey0=Math.min(sa.cy,sb.cy)-4, ey1=Math.max(sa.cy,sb.cy)+4;
+    if(ex1<x0||ex0>x1||ey1<y0||ey0>y1) continue;
+
+    const pad = 12;
+    const avoidSet = buildCoreAvoid(ex0-pad, ey0-pad, ex1+pad, ey1+pad);
+    const path = routeCoarse(sa.cx, sa.cy, sb.cx, sb.cy, (gx,gy)=>{
+      const base = moveCost(biomeCell(gx,gy));
+      if(!isFinite(base)) return Infinity;
+      let c = base;
+      const ck = gx+','+gy;
+      if(S.world.roads.roadCells.has(ck)) c *= e.cls==='trunk' ? 0.3 : 0.35;
+      if(e.cls==='feeder' && S.world.roads.trunkCells.has(ck)) c *= 6;
+      if(avoidSet.has(ck) && !(gx===sa.cx&&gy===sa.cy) && !(gx===sb.cx&&gy===sb.cy)) c *= 8;
+      return c;
+    }, pad);
+    if(path === undefined) continue;   // corridor not streamed yet; retry later
+    if(path !== null){
+      e.path = path;
+      for(const [gx,gy] of e.path){
+        const ck = gx+','+gy;
+        S.world.roads.roadCells.add(ck);
+        if(e.cls==='trunk') S.world.roads.trunkCells.add(ck);
+      }
+      computeBridges(e);
+      markRoundabouts(e);
+      const dist = e.path.length;
+      S.world.roadGraph.adj.get(e.a)?.push({ to:e.b, dist, path:e.path });
+      S.world.roadGraph.adj.get(e.b)?.push({ to:e.a, dist, path:[...e.path].reverse() });
+      if(e.cls==='feeder'){
+        S.world.feederGraph.adj.get(e.a)?.push({ to:e.b, dist, path:e.path });
+        S.world.feederGraph.adj.get(e.b)?.push({ to:e.a, dist, path:[...e.path].reverse() });
+        S.world.feederGraph.nEdges++;
+      }
+      sa.degree++; sb.degree++;
+      built = true;
+    }
+  }
+  return built;
 }

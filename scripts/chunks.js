@@ -1,106 +1,104 @@
-// FINE CHUNKS (multi-tier LOD) — generated off the main thread by
-// chunkWorker.js so the UI never freezes. This module owns the worker, ships
-// the coarse skeleton to it once per regenerate, requests visible chunks
-// asynchronously, and caches the returned ImageBitmaps (LRU eviction). Each
-// LOD tier t keeps its own cache of (CHUNK>>t)² bitmaps; tier 3 doesn't stream
-// chunks at all — render.js stretches a single coarse-grid raster instead
-// (coarseBitmap.js). Also bakes farmland (feature h) — inside the worker.
+// FINE CHUNKS — cached ImageBitmaps rasterized by chunkWorker.js off the
+// main thread. A chunk is only sent to the worker once every mega-tile under
+// it (plus sampler margin) has streamed in; requests that arrive too early
+// park in a wait queue and flush when the next tile lands. An LRU map keeps
+// the bitmap cache bounded while the viewport roams the infinite plane.
 
-import { S, CHUNK, COARSE_SCALE } from './state.js';
-import { invalidateCoarseBitmap } from './coarseBitmap.js';
+import { S, CHUNK } from './state.js';
+import { postToWorker, setChunkHandler, isAreaReady, initStream,
+         setFarmland as streamSetFarmland } from './worldTiles.js';
 
 const chunkKey = (cx,cy) => cx + ',' + cy;
 
-let worker = null;
-let gen = 0;                 // bumped on every resetChunks(); stamps requests/results
-let onReady = null;          // callback invoked when a fresh bitmap arrives (triggers redraw)
-
-// Called by render.js when a bitmap arrives, so it can schedule a redraw.
+let onReady = null;   // callback invoked when a fresh bitmap arrives (redraw)
 export function setChunkReadyCallback(fn){ onReady = fn; }
 
 // Per-tier state: cached bitmaps + keys currently in flight to the worker.
 const tiers = [];
 function tierState(t){
   let ts = tiers[t];
-  if(!ts){ ts = { map:new Map(), pending:new Set() }; tiers[t] = ts; }
+  if(!ts){ ts = { map:new Map(), pending:new Set(), waiting:new Set() }; tiers[t] = ts; }
   return ts;
 }
 
-function ensureWorker(){
-  if(worker) return worker;
-  worker = new Worker(new URL('./chunkWorker.js', import.meta.url), { type:'module' });
-  worker.onmessage = (ev) => {
-    const m = ev.data;
-    if(m.type !== 'chunk') return;
-    if(m.gen !== gen){ m.bitmap?.close?.(); return; }  // stale world
-    const ts = tierState(m.lod||0), k = chunkKey(m.cx, m.cy);
-    ts.pending.delete(k);
-    const prev = ts.map.get(k);
-    if(prev?.bmp?.close) prev.bmp.close();
-    ts.map.set(k, { bmp: m.bitmap, lastUsed: performance.now() });
-    if(onReady) onReady();
-  };
-  return worker;
-}
+setChunkHandler((m) => {
+  if(m.type === 'chunkFail'){
+    const ts = tierState(m.lod||0), k = chunkKey(m.cx,m.cy);
+    ts.pending.delete(k);      // tile vanished mid-flight; retry on next view
+    return;
+  }
+  const ts = tierState(m.lod||0), k = chunkKey(m.cx,m.cy);
+  ts.pending.delete(k);
+  const prev = ts.map.get(k);
+  if(prev?.bmp?.close) prev.bmp.close();
+  ts.map.set(k, { bmp:m.bitmap, lastUsed:performance.now() });
+  if(onReady) onReady();
+});
 
-// Ship the freshly-generated coarse skeleton to the worker and invalidate every
-// cache. Call after generateCoarse + buildRoads (settlements have tiers by then).
-export function resetChunks(){
-  ensureWorker();
+let gen = 0;
+
+// Fresh world: restart the worker pipeline and clear every cache. Call after
+// params change (seed/sea/mtn/rivers/density).
+export function resetChunks(params){
   gen++;
-  invalidateCoarseBitmap();   // tier-3 raster is derived from the old skeleton
+  initStream(params);
   for(const ts of tiers){
-    ts.pending.clear();
+    ts.pending.clear(); ts.waiting.clear();
     for(const ch of ts.map.values()){ ch.bmp?.close?.(); }
     ts.map.clear();
   }
+  postToWorker({ type:'farmland', flag:S.layers.farmland });
+}
 
-  const w = S.world;
-  // Copy typed arrays so the main thread keeps its own (render/tooltip/roads read them).
-  const world = {
-    params: w.params,
-    elev: w.elev.slice(), temp: w.temp.slice(),
-    moist: w.moist.slice(), biome: w.biome.slice(),
-    settlements: w.settlements.map(s => ({ x:s.x, y:s.y, tier:s.tier, score:s.score })),
-    GW: w.GW, GH: w.GH,
-  };
-  worker.postMessage({ type:'init', gen, seed: w.params.seed, farmland: S.layers.farmland, world });
+export function setFarmland(flag){
+  streamSetFarmland(flag);
+  for(const ts of tiers){
+    for(const ch of ts.map.values()){ ch.bmp?.close?.(); }
+    ts.map.clear();
+  }
 }
 
 // Return the cached bitmap for a chunk at an LOD tier, or request it (async)
 // and return null. render.js draws whatever is cached and skips misses until
-// they arrive.
+// they arrive. Chunks over unstreamed tiles are parked until those land.
 export function getChunk(cx, cy, lod=0){
   const ts = tierState(lod), k = chunkKey(cx,cy);
   const ch = ts.map.get(k);
   if(ch){ ch.lastUsed = performance.now(); return ch; }
-  if(worker && !ts.pending.has(k)){
-    ts.pending.add(k);
-    worker.postMessage({ type:'chunk', gen, cx, cy, lod });
-  }
+  if(ts.pending.has(k)) return null;
+  const pad = 16;   // must match chunkWorker.chunkTilesReady
+  const x0=cx*CHUNK-pad, y0=cy*CHUNK-pad,
+        x1=cx*CHUNK+CHUNK+pad, y1=cy*CHUNK+CHUNK+pad;
+  if(!isAreaReady(x0,y0,x1,y1)){ ts.waiting.add(k); return null; }
+  ts.waiting.delete(k);
+  ts.pending.add(k);
+  postToWorker({ type:'chunk', gen, cx, cy, lod });
   return null;
+}
+
+// Tiles arrived -> some parked chunks may now be buildable.
+export function flushWaiting(){
+  for(let t=0;t<tiers.length;t++){
+    const ts = tiers[t]; if(!ts || !ts.waiting.size) continue;
+    for(const k of [...ts.waiting]){
+      const [cx,cy] = k.split(',').map(Number);
+      getChunk(cx, cy, t);
+    }
+  }
 }
 
 export function cachedChunkCount(){
   return tiers.reduce((n,t)=>n+(t?t.map.size:0), 0);
 }
 
-export function evictChunks(max=400){
-  // Each tier-t chunk is a (CHUNK>>t)² ImageBitmap ≈ 4KB/1KB/256B. The cache
-  // must hold at least every chunk in the world (worst case 16384 per tier), or
-  // eviction thrashes: visible chunks are evicted, re-requested and re-shown as
-  // placeholders — seen as flicker. Coarser tiers get proportionally larger
-  // count caps so each tier costs roughly the same memory (~64MB worst case).
-  const total = Math.ceil(S.GW*COARSE_SCALE/CHUNK) * Math.ceil(S.GH*COARSE_SCALE/CHUNK);
-  tiers.forEach((ts,t)=>{
-    if(!ts) return;
-    const cap = Math.max(max, Math.min(total, 16384) << t);
-    if(ts.map.size <= cap) return;
-    const arr = [...ts.map.entries()].sort((a,b)=>a[1].lastUsed-b[1].lastUsed);
-    for(let i=0;i<arr.length-cap;i++){
-      const ch = arr[i][1];
-      ch.bmp?.close?.();
-      ts.map.delete(arr[i][0]);
-    }
-  });
+// Cache cap: each 32² bitmap is 4 KB, so 3000 chunks cost ~12 MB.
+export function evictChunks(){
+  const CAP = 3000;
+  const ts = tiers[0];
+  if(!ts || ts.map.size <= CAP) return;
+  const arr = [...ts.map.entries()].sort((a,b)=>a[1].lastUsed-b[1].lastUsed);
+  for(let i=0;i<arr.length-CAP;i++){
+    arr[i][1].bmp?.close?.();
+    ts.map.delete(arr[i][0]);
+  }
 }

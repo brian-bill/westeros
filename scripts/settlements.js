@@ -1,74 +1,129 @@
-// Settlement placement on the coarse grid: suitability scoring + Poisson-disk-ish
-// greedy placement. Tiers (village/town/city) are assigned later in roads.js once
-// road connectivity is known; placement predicts a tier from score rank so that
-// separation can be enforced per tier in METRIC units (see M_PER_FINE).
+// Settlements on deterministic lattices.
+//
+// The finite world placed settlements with one global greedy pass; infinity
+// needs placement that is independent of load order. Two fixed lattices do
+// exactly that, because membership is a pure function of (seed, lattice
+// coords, local suitability):
+//
+//   urban  — pitch UCELL coarse cells (~64 km): each cell may host ONE place,
+//            rolled city/town/village by hash shares and gated by site score.
+//            The pitch itself guarantees the metric rule (any two urban sites
+//            >= ~57 km apart, above the 50 km spec) with no demotion pass.
+//   rural  — pitch VCELL coarse cells (~8 km): frequent village candidates,
+//            gated harder so only fertile, well-watered sites settle.
+//
+// The chunk worker evaluates SUITABILITY (needs terrain context); the main
+// thread applies GATES + tiers + names and registers the survivors here.
 
-import { B } from './biomes.js';
-import { S, COARSE_SCALE, fineToKm, kmToFine } from './state.js';
-const NB8 = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+import { xmur3, mulberry32 } from './rng.js';
+import { S, COARSE_SCALE } from './state.js';
+import { settlementName } from './names.js';
 
-// Minimum pairwise separation in km (metric via M_PER_FINE): any two URBAN
-// places (town/city) keep >= 50 km apart; rural villages may cluster much
-// closer (7 km), including around towns, as real settlements do.
-export const MIN_SEP_KM = { rural:7, urban:50 };
+export const UCELL = 96;   // urban lattice pitch, coarse cells (~77 km)
+export const VCELL = 13;   // rural lattice pitch, coarse cells (~10 km)
 
-export function placeSettlements(nSettle, sea){
-  const { biome, elev } = S.world;
-  const GW = S.GW, GH = S.GH, N = GW*GH;
-  const settlements = S.world.settlements = [];
-  if(nSettle <= 0) return;
+// Built-up footprint radii before neighbor clamping (fine cells), consumed by
+// settlementDetail.js via s.maxR.
+export const BASE_R = [3.5,6,10].map(r => r*COARSE_SCALE*0.5);
 
-  // BFS distance-to-fresh-water (capped at 6 coarse cells)
-  const distW = new Int16Array(N).fill(9999);
-  const q = [];
-  for(let i=0;i<N;i++) if(biome[i]===B.RIVER||biome[i]===B.LAKE){ distW[i]=0; q.push(i); }
-  for(let h=0;h<q.length;h++){ const i=q[h]; if(distW[i]>=6) continue;
-    const px=i%GW, py=(i/GW)|0;
-    for(const [dx,dy] of NB8){ const nx=px+dx, ny=py+dy;
-      if(nx<0||ny<0||nx>=GW||ny>=GH) continue; const j=ny*GW+nx;
-      if(distW[j]>distW[i]+1){ distW[j]=distW[i]+1; q.push(j); } } }
+// Min gap between adjacent-cell candidates is 2*JITTER (positions live in
+// [m, cell-m]), so: villages >= 8.8 coarse = ~7.0 km; urban sites
+// >= 63 coarse = ~50.4 km — the metric separation rules, by construction.
+export const JITTER = { u:31.5, v:4.4 };
 
-  // suitability score
-  const score = new Float32Array(N).fill(-1);
-  for(let y=1;y<GH-1;y++) for(let x=1;x<GW-1;x++){
-    const i=y*GW+x, b=biome[i];
-    if(elev[i]<sea||b===B.RIVER||b===B.LAKE||b===B.SWAMP||b===B.MOUNTAIN||b===B.SNOW||b===B.BEACH) continue;
-    const flat = 1 - Math.min(1,(Math.abs(elev[i]-elev[i+1])+Math.abs(elev[i]-elev[i+GW]))*40);
-    const water = Math.max(0, 1 - distW[i]/6);
-    const fertile = (b===B.GRASSLAND?1 : b===B.FOREST?0.7 : b===B.RAINFOREST?0.5 : 0.3);
-    let coast=0; for(const [dx,dy] of NB8){ if(elev[(y+dy)*GW+(x+dx)]<sea){ coast=0.5; break; } }
-    score[i] = flat*0.35 + water*0.35 + fertile*0.25 + coast*0.2;
-  }
+// Deterministic jittered candidate for a lattice cell: same everywhere, forever.
+export function latticeCandidate(seed, kind, lx, ly){
+  const rand = mulberry32(xmur3(seed + '::lat:' + kind + ':' + lx + ':' + ly)());
+  const cell = kind==='u' ? UCELL : VCELL, m = JITTER[kind];
+  return {
+    gx: lx*cell + m + rand()*(cell - 2*m),
+    gy: ly*cell + m + rand()*(cell - 2*m),
+    r0: rand(),   // occupancy roll
+    r1: rand()    // tier roll (urban cells)
+  };
+}
 
-  // greedy placement with tier-aware minimum spacing (in km). The k-th best
-  // SITE is predicted to become city/town/village with the same Zipf shares
-  // roads.js later uses. Two predicted-urban sites need MIN_SEP_KM.urban (50
-  // km); everything else just keeps rural elbow room (7 km). Prediction
-  // follows candidate rank, so rejected sites can't stall lower tiers.
-  const cand = [...Array(N).keys()].filter(i=>score[i]>0.35).sort((a,b)=>score[b]-score[a]);
-  const worldKm = fineToKm(GW*COARSE_SCALE);
-  const clampKm = km => Math.min(km, worldKm*0.45);   // tiny worlds: scale down
-  const sepRural = kmToFine(clampKm(MIN_SEP_KM.rural));
-  const sepUrban = kmToFine(clampKm(MIN_SEP_KM.urban));
-  const nCity = Math.max(1, Math.round(nSettle*0.10));
-  const nTown = Math.round(nSettle*0.25);
-  let rank = -1;
-  for(const i of cand){
-    if(settlements.length>=nSettle) break;
-    rank++;
-    const px=i%GW, py=(i/GW)|0;
-    const fx=(px+0.5)*COARSE_SCALE, fy=(py+0.5)*COARSE_SCALE;   // fine coords
-    const predTier = rank<nCity ? 2 : rank<nCity+nTown ? 1 : 0;
-    let ok=true;
-    for(const s of settlements){
-      const need = (predTier>=1 && s.ptier>=1) ? sepUrban : sepRural;
-      if(Math.hypot(s.x-fx, s.y-fy) < need){ ok=false; break; }   // fine-space dist
+// Gate + register the candidates a freshly streamed tile proposed. Returns
+// the new settlement objects (caller wires roads/ports/worker forwarding).
+export function registerTileCandidates(tile){
+  const p = S.params;
+  const dens = Math.max(0, Math.min(1.6, p.density));
+  const fresh = [];
+  for(const c of tile.cands || []){
+    const id = c.k + ':' + c.lx + ':' + c.ly;
+    if(S.world.byId.has(id)) continue;          // lattice cells can straddle tiles
+    let tier;
+    if(c.k === 'u'){
+      if(c.score <= 0.40 || c.r0 >= 0.38*dens) continue;
+      tier = (c.r1 < 0.14 && c.score > 0.56) ? 2 : c.score > 0.46 ? 1 : 0;
+    } else {
+      if(c.score <= 0.34 || c.r0 >= 0.62*dens) continue;
+      tier = 0;
     }
-    if(ok) settlements.push({
-      cx:px, cy:py,                                       // coarse coords
-      x:(px+0.5)*COARSE_SCALE, y:(py+0.5)*COARSE_SCALE,   // fine world coords
-      score:score[i], tier:0, degree:0, buildings:null, streets:null, R:0,
-      ptier:predTier,                                     // predicted tier at placement
-    });
+    const idx = S.world.settlements.length;
+    const cx = Math.floor(c.gx), cy = Math.floor(c.gy);   // integer coarse site
+    const s = {
+      id,
+      idx,                                        // stable registry index
+      cx, cy,                                     // coarse coords
+      x: (cx+0.5)*COARSE_SCALE, y: (cy+0.5)*COARSE_SCALE,   // fine coords
+      score: c.score, tier, ptier: tier,
+      degree: 0, maxR: Infinity,
+      buildings: null, streets: null, R: 0, style: null,
+      name: settlementName(p.seed, id),
+      port: null
+    };
+    S.world.byId.set(id, s);
+    S.world.settlements.push(s);
+    S.world.roadGraph.nodes.push({ idx, cx:s.cx, cy:s.cy, tier:s.tier });
+    S.world.roadGraph.adj.set(idx, []);
+    S.world.feederGraph.nodes.push({ idx, cx:s.cx, cy:s.cy });
+    S.world.feederGraph.adj.set(idx, []);
+    fresh.push(s);
   }
+  return fresh;
+}
+
+// Cap built-up footprints so neighboring settlements never overlap. Runs per
+// registration and mutually re-clamps already-known lattice neighbors, whose
+// positions are deterministic, so the result converges to the same caps any
+// order would produce.
+export function recapFootprints(s){
+  const MARGIN = 3;
+  const touch = new Set([s]);
+  const reach = BASE_R[2] * 2 + MARGIN;
+  for(const n of settlementsNear(s.cx, s.cy, reach, () => true)){
+    if(n === s) continue;
+    touch.add(n);
+  }
+  for(const t of touch){
+    let r = t === s ? BASE_R[t.tier] : (t.maxR===Infinity ? BASE_R[t.tier] : t.maxR);
+    for(const n of settlementsNear(t.cx, t.cy, reach, () => true)){
+      if(n === t) continue;
+      const nr = n.maxR===Infinity ? BASE_R[n.tier] : n.maxR;
+      r = Math.min(r, Math.hypot(t.x-n.x, t.y-n.y) - nr - MARGIN);
+    }
+    const was = t.maxR;
+    t.maxR = Math.max(0, r);
+    if(t.maxR !== was){           // footprint shrank -> drop any built detail
+      t.buildings = null; t.streets = null;
+    }
+  }
+}
+
+// Registered settlements within r coarse cells of (cx,cy), nearest first.
+// Enumerates lattice cells directly — no spatial index needed.
+export function settlementsNear(cx, cy, r, pred){
+  const out = [];
+  const scan = (cell, kind) => {
+    const lx0 = Math.floor((cx-r)/cell), lx1 = Math.floor((cx+r)/cell);
+    const ly0 = Math.floor((cy-r)/cell), ly1 = Math.floor((cy+r)/cell);
+    for(let ly=ly0; ly<=ly1; ly++) for(let lx=lx0; lx<=lx1; lx++){
+      const st = S.world.byId.get(kind + ':' + lx + ':' + ly);
+      if(st && (!pred || pred(st)) && Math.hypot(st.cx-cx, st.cy-cy) <= r) out.push(st);
+    }
+  };
+  scan(UCELL,'u'); scan(VCELL,'v');
+  out.sort((a,b)=>Math.hypot(a.cx-cx,a.cy-cy)-Math.hypot(b.cx-cx,b.cy-cy));
+  return out;
 }

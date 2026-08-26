@@ -1,12 +1,16 @@
-// Viewport-driven rendering: stream visible chunks, draw road/building/settlement/
-// agent overlays, apply level-of-detail (LOD) based on zoom.
+// Viewport-driven rendering across three regimes selected by zoom:
+//   fine chunks   — streamed ImageBitmaps, LOD tiers by screen px per chunk;
+//   coarse tiles  — one small canvas per mega-tile, stretched;
+//   overview      — cheap pure-field tiles for planetary zoom-out.
+// Road/building/settlement/agent/label overlays draw on top in world space at
+// every regime; labels are placed in SCREEN space so they stay legible.
 
-import { S, CHUNK, COARSE_SCALE, LOD_PX, worldFineW, worldFineH } from './state.js';
+import { S, CHUNK, COARSE_SCALE, TILE, OTILE,
+         SCALE_CHUNK_MIN, SCALE_OVERVIEW_MAX } from './state.js';
 import { getChunk, evictChunks, cachedChunkCount } from './chunks.js';
+import { getTileBitmap, getOverviewBitmap, provisionalColor, regionsList } from './worldTiles.js';
 import { ensureSettlementDetail, ARCH } from './settlementDetail.js';
 import { agentPos, agentTangent } from './agents.js';
-import { COLOR } from './biomes.js';
-import { getCoarseBitmap } from './coarseBitmap.js';
 
 let canvas, ctx;
 export function initRenderer(cnv){ canvas = cnv; ctx = cnv.getContext('2d'); }
@@ -14,6 +18,11 @@ export function getCanvas(){ return canvas; }
 
 export function screenToWorld(sx, sy){
   return [(sx-S.view.x)/S.view.scale, (sy-S.view.y)/S.view.scale];
+}
+
+// Visible fine-world rect (used by the streaming maintainer too).
+export function viewportRect(){
+  return [...screenToWorld(0,0), ...screenToWorld(canvas.clientWidth, canvas.clientHeight)];
 }
 
 export function draw(){
@@ -29,48 +38,83 @@ export function draw(){
   ctx.imageSmoothingEnabled = false; ctx.fillStyle = '#0a0d11'; ctx.fillRect(0,0,cw,ch);
   if(!S.world) return;
   const { view, layers } = S;
-  ctx.save(); ctx.translate(view.x, view.y); ctx.scale(view.scale, view.scale);
 
-  // visible fine-world rect -> chunk range
+  // visible fine-world rect -> source ranges (unbounded world: no clamps)
   const [wx0,wy0] = screenToWorld(0,0), [wx1,wy1] = screenToWorld(cw,ch);
-  const WFX = worldFineW(), WFY = worldFineH();
-  const minCX = Math.max(0, Math.floor(wx0/CHUNK)), maxCX = Math.min(Math.ceil(WFX/CHUNK)-1, Math.floor(wx1/CHUNK));
-  const minCY = Math.max(0, Math.floor(wy0/CHUNK)), maxCY = Math.min(Math.ceil(WFY/CHUNK)-1, Math.floor(wy1/CHUNK));
 
-  let drawn = 0, pending = 0, lod = 0;
+  // Terrain is drawn in SCREEN space with device-pixel-snapped edges:
+  // adjacent bitmaps then share exact boundary coordinates, which kills the
+  // hairline seams fractional world-transform scaling otherwise leaves.
+  // Overlays below re-apply the world transform.
+  const s2x = wx => wx*view.scale + view.x;
+  const s2y = wy => wy*view.scale + view.y;
+
+  let drawn = 0, pending = 0, regime = 'chunk';
   if(layers.terrain){
-    // Multi-tier terrain LOD: pick the coarsest tier whose texels stay >= ~1
-    // screen px. Tiers 0-2 stream chunk bitmaps at full/half/quarter fine
-    // resolution; at tier 3 a single whole-world raster of the coarse grid is
-    // stretched over the world rect and no chunks are streamed at all.
-    const chunkPx = view.scale*CHUNK;
-    while(lod<LOD_PX.length && chunkPx < LOD_PX[lod]) lod++;
-    if(lod < 3){
+    if(view.scale >= SCALE_CHUNK_MIN){
+      // ---- fine chunks (full-resolution tier) ---------------------------
+      regime = 'chunk';
+      // minified chunks: bilinear blends neighbouring bitmaps
+      ctx.imageSmoothingEnabled = view.scale < 1;
+      const minCX = Math.floor(wx0/CHUNK), maxCX = Math.floor(wx1/CHUNK);
+      const minCY = Math.floor(wy0/CHUNK), maxCY = Math.floor(wy1/CHUNK);
       for(let cy=minCY;cy<=maxCY;cy++) for(let cx=minCX;cx<=maxCX;cx++){
-        const c = getChunk(cx,cy,lod);
-        if(c){ ctx.drawImage(c.bmp, cx*CHUNK, cy*CHUNK, CHUNK, CHUNK); drawn++; }
-        else { drawPlaceholder(cx, cy); pending++; }   // worker still generating this chunk
+        const sx = Math.round(s2x(cx*CHUNK)), sy = Math.round(s2y(cy*CHUNK));
+        const sw = Math.round(s2x((cx+1)*CHUNK)) - sx, sh = Math.round(s2y((cy+1)*CHUNK)) - sy;
+        const c = getChunk(cx,cy,0);
+        if(c){ ctx.drawImage(c.bmp, sx, sy, sw, sh); drawn++; }
+        else {
+          ctx.fillStyle = provisionalColor((cx+0.5)*CHUNK, (cy+0.5)*CHUNK, 'c:'+cx+','+cy);
+          ctx.fillRect(sx, sy, sw, sh); pending++;
+        }
       }
+      ctx.imageSmoothingEnabled = false;
+    } else if(view.scale >= SCALE_OVERVIEW_MAX){
+      // ---- mega-tile bitmaps -------------------------------------------
+      regime = 'tile';
+      const T = TILE*COARSE_SCALE;
+      ctx.imageSmoothingEnabled = true;   // coarse texels are sub-pixel here
+      const minTX = Math.floor(wx0/T), maxTX = Math.floor(wx1/T);
+      const minTY = Math.floor(wy0/T), maxTY = Math.floor(wy1/T);
+      for(let ty=minTY;ty<=maxTY;ty++) for(let tx=minTX;tx<=maxTX;tx++){
+        const sx = Math.round(s2x(tx*T)), sy = Math.round(s2y(ty*T));
+        const sw = Math.round(s2x((tx+1)*T)) - sx, sh = Math.round(s2y((ty+1)*T)) - sy;
+        const bmp = getTileBitmap(tx,ty);
+        if(bmp){ ctx.drawImage(bmp, sx, sy, sw, sh); drawn++; }
+        else {
+          ctx.fillStyle = provisionalColor((tx+0.5)*T, (ty+0.5)*T, 't:'+tx+','+ty);
+          ctx.fillRect(sx, sy, sw, sh); pending++;
+        }
+      }
+      ctx.imageSmoothingEnabled = false;
     } else {
-      const bmp = getCoarseBitmap();
-      if(bmp){
-        // Bilinear when the coarse raster is minified (very far zoom), crisp
-        // texels otherwise — matches the pixelated look of the chunk tiers.
-        ctx.imageSmoothingEnabled = view.scale*COARSE_SCALE < 1;
-        ctx.drawImage(bmp, 0, 0, worldFineW(), worldFineH());
-        ctx.imageSmoothingEnabled = false;
-        drawn++;
+      // ---- overview tiles ------------------------------------------------
+      regime = 'overview';
+      const E = OTILE*COARSE_SCALE;
+      ctx.imageSmoothingEnabled = true;
+      const minOX = Math.floor(wx0/E), maxOX = Math.floor(wx1/E);
+      const minOY = Math.floor(wy0/E), maxOY = Math.floor(wy1/E);
+      for(let oy=minOY;oy<=maxOY;oy++) for(let ox=minOX;ox<=maxOX;ox++){
+        const sx = Math.round(s2x(ox*E)), sy = Math.round(s2y(oy*E));
+        const sw = Math.round(s2x((ox+1)*E)) - sx, sh = Math.round(s2y((oy+1)*E)) - sy;
+        const bmp = getOverviewBitmap(ox,oy);
+        if(bmp){ ctx.drawImage(bmp, sx, sy, sw, sh); drawn++; }
+        else { ctx.fillStyle = '#101722'; ctx.fillRect(sx, sy, sw, sh); pending++; }
       }
+      ctx.imageSmoothingEnabled = false;
     }
   }
   evictChunks();
 
-  // roads (coarse cell paths -> fine world polylines), two visual classes:
-  // wide dark trunk highways and thin faint village feeder spurs
+  ctx.save(); ctx.translate(view.x, view.y); ctx.scale(view.scale, view.scale);
+
+  // roads — two visual classes: wide dark trunk highways and thin faint
+  // village feeder spurs; paths are world-space cell pair polylines
   if(layers.roads && S.world.roads){
     ctx.lineCap='round'; ctx.lineJoin='round';
-    const cellPt = ci => [((ci%S.GW)+0.5)*COARSE_SCALE, (((ci/S.GW)|0)+0.5)*COARSE_SCALE];
+    const cellPt = c => [(c[0]+0.5)*COARSE_SCALE, (c[1]+0.5)*COARSE_SCALE];
     for(const e of S.world.roads.edges){
+      if(!e.path) continue;
       const hi = e.cls !== 'feeder';
       ctx.strokeStyle = hi ? 'rgba(58,45,30,0.95)' : 'rgba(80,66,48,0.5)';
       ctx.lineWidth = hi ? 1.7 : 0.85;
@@ -83,7 +127,7 @@ export function draw(){
     // bridge siderails: paired lines flanking the roadway wherever it runs
     // over water (spans precomputed in roads.js as world-space polylines)
     for(const e of S.world.roads.edges){
-      if(!e.bridges || !e.bridges.length) continue;
+      if(!e.path || !e.bridges || !e.bridges.length) continue;
       const hi = e.cls !== 'feeder';
       const off = hi ? 1.05 : 0.65;   // just outside the carriageway edge
       ctx.strokeStyle = 'rgba(139,109,59,0.95)';
@@ -188,10 +232,10 @@ export function draw(){
 
   ctx.restore();
 
-  // Named labels (feature: names layer) — drawn in SCREEN space after the world
-  // transform is popped, so font size stays legible at any zoom. Greedy
-  // rectangle rejection stops labels from overprinting: cities claim space
-  // first, then towns/villages/regions fit in wherever there's room.
+  // Named labels — drawn in SCREEN space after the world transform is popped,
+  // so font size stays legible at any zoom. Greedy rectangle rejection stops
+  // labels from overprinting: cities claim space first, then
+  // towns/villages/regions fit in wherever there's room.
   if(layers.labels && S.world.settlements){
     const rects = [];
     const fits = (x,y,w,h)=>{ for(const r of rects)
@@ -228,7 +272,7 @@ export function draw(){
 
     // regions: large, quiet, all-caps italic names anchored inside landmasses
     ctx.letterSpacing = '3px';
-    for(const rg of S.world.regions || []){
+    for(const rg of regionsList()){
       const sx = rg.x*view.scale + view.x, sy = rg.y*view.scale + view.y;
       if(sx<-200||sx>cw+200||sy<-60||sy>ch+60) continue;
       put(rg.name.toUpperCase(), sx, sy, 15, `italic 600 15px ${MONO}`,
@@ -237,14 +281,5 @@ export function draw(){
     ctx.letterSpacing = '0px';
   }
 
-  window.__stats = { drawn, pending, cached:cachedChunkCount(), lod };
-}
-
-// Fill a not-yet-generated chunk with its nearest coarse biome color, so the
-// viewport shows an instant low-detail approximation while the worker catches up.
-function drawPlaceholder(cx, cy){
-  const gx = Math.min(S.GW-1, Math.max(0, Math.round((cx*CHUNK+CHUNK/2)/COARSE_SCALE-0.5)));
-  const gy = Math.min(S.GH-1, Math.max(0, Math.round((cy*CHUNK+CHUNK/2)/COARSE_SCALE-0.5)));
-  ctx.fillStyle = COLOR[S.world.biome[gy*S.GW+gx]] || '#0a0d11';
-  ctx.fillRect(cx*CHUNK, cy*CHUNK, CHUNK, CHUNK);
+  window.__stats = { drawn, pending, cached:cachedChunkCount(), regime };
 }

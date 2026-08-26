@@ -1,70 +1,94 @@
-// Entry point: wires UI controls, interaction (pan/zoom/hover), the generation
-// pipeline, and the animation loop.
+// Entry point: wires UI controls, interaction (pan/zoom/hover), the infinite
+// generation pipeline, and the animation loop. There is no "generate the
+// world" pass any more — terrain, settlements and roads all stream around
+// whatever the viewport does.
 
 import { B, COLOR, NAME } from './biomes.js';
-import { S, CHUNK, COARSE_SCALE, M_PER_FINE, worldFineW, worldFineH } from './state.js';
-import { generateCoarse } from './coarse.js';
-import { buildRoads } from './roads.js';
-import { buildWaterways, buildFeederGraph } from './navigation.js';
-import { spawnAgents, stepAgents } from './agents.js';
-import { refineFineBiome } from './fields.js';
-import { initRenderer, getCanvas, draw, screenToWorld } from './render.js';
-import { resetChunks, setChunkReadyCallback } from './chunks.js';
+import { S, CHUNK, COARSE_SCALE, SCALE_MIN, SCALE_MAX, M_PER_FINE } from './state.js';
+import { makeParamNoise, elevationAt } from './fields.js';
+import { assignPort, ensureLanes } from './navigation.js';
+import { registerTileCandidates, recapFootprints } from './settlements.js';
+import { tryLinkSettlement, ensureRoads } from './roads.js';
+import { maintainAgents, stepAgents } from './agents.js';
+import { onTileReady, onChange, updateStreaming, postToWorker,
+         streamStats, refineFineBiome } from './worldTiles.js';
+import { resetChunks, setChunkReadyCallback, flushWaiting, setFarmland } from './chunks.js';
+import { initRenderer, getCanvas, draw, screenToWorld, viewportRect } from './render.js';
 
 const $ = id => document.getElementById(id);
 
 initRenderer($('c'));
 const canvas = getCanvas();
 
-// When the worker finishes a chunk, coalesce redraws into the next animation frame.
-let redrawQueued = false;
-setChunkReadyCallback(() => {
-  if(redrawQueued) return;
-  redrawQueued = true;
-  requestAnimationFrame(() => { redrawQueued = false; draw(); });
+// A new mega-tile just arrived: turn its settlement candidates into real
+// places and wire them into the networks.
+onTileReady(tile => {
+  const fresh = registerTileCandidates(tile);
+  if(!fresh.length) return;
+  const batch = [];
+  for(const s of fresh){
+    recapFootprints(s);          // anti-overlap caps (may touch neighbors too)
+    tryLinkSettlement(s);        // propose edges to nearest neighbors
+    assignPort(s);               // harbor berth if water is close enough
+    batch.push({ x:s.x, y:s.y, tier:s.tier, score:s.score });
+  }
+  postToWorker({ type:'setts', list:batch });   // worker bakes their farmland
 });
 
+// Streaming arrivals invalidate what's on screen; coalesce redraws per frame.
+let dirty = true;
+setChunkReadyCallback(() => { dirty = true; });
+onChange(() => { flushWaiting(); dirty = true; });
+
 //--------------------------------------------------------------------------
-// Generation pipeline
+// World lifecycle
 //--------------------------------------------------------------------------
 function readParams(){
   return {
     seed: $('seed').value || 'seed',
     sea: +$('sea').value, mtn: +$('mtn').value,
-    riverThresh: +$('riv').value, nSettle: +$('setn').value,
-    worldSize: +$('worldSz').value
+    riverThresh: +$('riv').value,
+    density: +$('setn').value/100
   };
 }
 
-function regenerate(){
-  const p = readParams(); const t0 = performance.now();
+function initWorld(p){
   const url = new URL(location.href);
   url.searchParams.set('seed', p.seed);
   history.replaceState(null, '', url);
-  generateCoarse(p);
-  buildRoads();
-  buildWaterways();
-  buildFeederGraph();   // pedestrian network: feeder-road spurs only
-  spawnAgents();
-  resetChunks();   // ship the fresh coarse skeleton to the chunk worker + clear cache
-  const t1 = performance.now();
-  const c = {0:0,1:0,2:0}; S.world.settlements.forEach(s=>c[s.tier]++);
-  const modes = {vehicle:0,boat:0,ped:0}; S.agents.forEach(a=>modes[a.mode]++);
-  const WFX = worldFineW();
-  const km = WFX*M_PER_FINE/1000;
-  $('stat').textContent =
-    `skeleton ${(t1-t0).toFixed(0)}ms · coarse ${S.GW}×${S.GH} → ${WFX}×${WFX} fine cells\n` +
-    `${c[2]} cities, ${c[1]} towns, ${c[0]} villages · ${S.world.roads.edges.length} roads · ${S.world.waterGraph?.lanes.length||0} sea lanes\n` +
-    `${S.agents.length} agents: ${modes.vehicle} vehicles · ${modes.boat} boats · ${modes.ped} hikers · ` +
-    `scale ${M_PER_FINE} m/cell · world ${km.toFixed(0)} km across`;
-  draw();
+
+  S.params = p;
+  S.noiseFns = makeParamNoise(p.seed);
+  S.world = {
+    settlements: [], byId: new Map(),
+    roads: { edges:[], edgeKeys:new Set(), edgeByKey:new Map(),
+             roadCells:new Set(), trunkCells:new Set() },
+    roundabouts: [],
+    roadGraph:   { nodes:[], adj:new Map() },
+    feederGraph: { nodes:[], adj:new Map(), nEdges:0 },
+    waterGraph:  { nodes:[], adj:new Map(), lanes:[], laneKeys:new Set() },
+  };
+  S.agents = [];
+  resetChunks(p);      // restarts the worker pipeline + clears all caches
+  bootView();
 }
 
-function fit(){
-  const WFX = worldFineW(); const s = Math.min(canvas.clientWidth, canvas.clientHeight)/WFX*0.95;
-  S.view.scale = s;
-  S.view.x = (canvas.clientWidth - WFX*s)/2;
-  S.view.y = (canvas.clientHeight - worldFineH()*s)/2;
+// Center the first view on land near the origin (spiral out until the pure
+// elevation field rises above sea level).
+function bootView(){
+  const sea = S.params.sea;
+  let cx = 0, cy = 0;
+  outer:
+  for(let r=0; r<=48; r++){
+    for(let a=0; a<24; a++){
+      const t = a/24*Math.PI*2;
+      const x = Math.round(Math.cos(t)*r*128), y = Math.round(Math.sin(t)*r*128);
+      if(elevationAt(x,y) > sea+0.03){ cx=x; cy=y; break outer; }
+    }
+  }
+  S.view.scale = 0.45;
+  S.view.x = canvas.clientWidth/2 - cx*S.view.scale;
+  S.view.y = canvas.clientHeight/2 - cy*S.view.scale;
 }
 
 //--------------------------------------------------------------------------
@@ -93,9 +117,9 @@ const pinchMid = () => {
 
 function zoomAt(mx, my, f){
   const [wx,wy] = screenToWorld(mx,my);
-  S.view.scale = Math.max(0.08, Math.min(30, S.view.scale*f));
+  S.view.scale = Math.max(SCALE_MIN, Math.min(SCALE_MAX, S.view.scale*f));
   S.view.x = mx - wx*S.view.scale; S.view.y = my - wy*S.view.scale;
-  draw();
+  dirty = true;
 }
 
 canvas.addEventListener('pointerdown', e=>{
@@ -125,7 +149,7 @@ canvas.addEventListener('pointermove', e=>{
     pinch = { dist: pinchSpan(), x: mx, y: my };
   } else if(panning && pointers.size === 1){
     S.view.x += pt[0]-last[0]; S.view.y += pt[1]-last[1];
-    last = pt; draw();
+    last = pt; dirty = true;
   }
   if(e.pointerType==='mouse') updateTip(e);
 });
@@ -174,7 +198,6 @@ function updateTip(e){
   if(!S.world) return;
   const r = canvas.getBoundingClientRect();
   const [fx,fy] = screenToWorld(e.clientX-r.left, e.clientY-r.top);
-  if(fx<0||fy<0||fx>=worldFineW()||fy>=worldFineH()){ tip.textContent='—'; return; }
   let head = '';
   let near=null, nd=Infinity;   // nearest named settlement, within a screen-ish radius
   for(const s of S.world.settlements){
@@ -184,7 +207,7 @@ function updateTip(e){
   if(near && nd < Math.max(10, 22/S.view.scale))
     head = `${near.name} · ${TIER_NAME[near.tier]}\n`;
   const { b, e:el } = refineFineBiome(fx,fy);
-  const cx=(fx/CHUNK)|0, cy=(fy/CHUNK)|0;
+  const cx=Math.floor(fx/CHUNK), cy=Math.floor(fy/CHUNK);
   tip.textContent =
     `${head}world ${fx.toFixed(0)},${fy.toFixed(0)} (${(fx*M_PER_FINE/1000).toFixed(1)}, ${(fy*M_PER_FINE/1000).toFixed(1)} km) chunk ${cx},${cy}\n` +
     `${NAME[b]}  elev ${el.toFixed(2)}`;
@@ -195,8 +218,8 @@ function updateTip(e){
 //--------------------------------------------------------------------------
 const bind = (id,lbl,fn) => { const el=$(id);
   el.addEventListener('input', ()=>{ $(lbl).textContent = fn ? fn(el.value) : el.value; }); };
-bind('sea','seaLbl'); bind('mtn','mtnLbl'); bind('riv','rivLbl'); bind('setn','setLbl');
-bind('worldSz','worldLbl', v => `${v} · ${(v*COARSE_SCALE*M_PER_FINE/1000).toFixed(0)} km`);
+bind('sea','seaLbl'); bind('mtn','mtnLbl'); bind('riv','rivLbl');
+bind('setn','setLbl', v => `${v}%`);
 
 const togWrap = $('toggles');
 Object.keys(S.layers).forEach(k=>{
@@ -205,8 +228,8 @@ Object.keys(S.layers).forEach(k=>{
   togWrap.appendChild(lab);
   lab.querySelector('input').addEventListener('change', ev=>{
     S.layers[k] = ev.target.checked;
-    if(k==='farmland') resetChunks();   // farmland is baked into chunk bitmaps (worker)
-    draw();
+    if(k==='farmland'){ setFarmland(ev.target.checked); dirty = true; }
+    dirty = true;
   });
 });
 
@@ -215,9 +238,9 @@ const legend = $('legend');
   .forEach(b=>{ const sw=document.createElement('div'); sw.className='sw'; sw.style.background=COLOR[b];
     const t=document.createElement('div'); t.textContent=NAME[b]; legend.appendChild(sw); legend.appendChild(t); });
 
-$('gen').addEventListener('click', regenerate);
-$('rnd').addEventListener('click', ()=>{ $('seed').value = Math.random().toString(36).slice(2,9); regenerate(); });
-window.addEventListener('resize', draw);
+$('gen').addEventListener('click', ()=>initWorld(readParams()));
+$('rnd').addEventListener('click', ()=>{ $('seed').value = Math.random().toString(36).slice(2,9); initWorld(readParams()); });
+window.addEventListener('resize', ()=>{ dirty = true; });
 
 //--------------------------------------------------------------------------
 // Small-screen UX: collapsible panel (button shown via CSS media query)
@@ -230,17 +253,52 @@ panelToggle.addEventListener('click', ()=>{
 });
 
 //--------------------------------------------------------------------------
-// Animation loop
+// Animation loop: keep the skeleton streamed under the viewport, extend the
+// road/lane networks into fresh ground, maintain agents near the view.
 //--------------------------------------------------------------------------
-let lastT = performance.now();
+let lastT = performance.now(), statTimer = 0;
 function loop(now){
   const dt = Math.min(50, (now-lastT))/16.67; lastT = now;
-  if((S.layers.vehicles||S.layers.boats||S.layers.peds) && S.agents.length){ stepAgents(dt); draw(); }
   requestAnimationFrame(loop);
+  if(!S.world) return;
+
+  const [wx0,wy0,wx1,wy1] = viewportRect();
+  updateStreaming(wx0, wy0, wx1, wy1);
+
+  // network growth works in coarse cells
+  const gx0=Math.floor(wx0/COARSE_SCALE), gy0=Math.floor(wy0/COARSE_SCALE);
+  const gx1=Math.ceil(wx1/COARSE_SCALE), gy1=Math.ceil(wy1/COARSE_SCALE);
+  let built = ensureRoads(gx0, gy0, gx1, gy1);
+  ensureLanes(gx0, gy0, gx1, gy1);
+
+  const animating = (S.layers.vehicles||S.layers.boats||S.layers.peds) && S.agents.length;
+  maintainAgents(dt, wx0, wy0, wx1, wy1);
+  if(animating || S.agents.length) stepAgents(dt);
+
+  statTimer -= dt;
+  if(statTimer <= 0){ statTimer = 60; updateStats(); }
+
+  if(dirty || built || animating){ dirty = false; draw(); }
 }
 
-// boot
+function updateStats(){
+  const st = streamStats();
+  const w = S.world;
+  const laid = w.roads.edges.filter(e=>e.path).length;
+  const c = {0:0,1:0,2:0}; w.settlements.forEach(s=>c[s.tier]++);
+  const modes = {vehicle:0,boat:0,ped:0}; S.agents.forEach(a=>modes[a.mode]++);
+  $('stat').textContent =
+    `${st.tiles} tiles · ${st.overviews} overviews streamed (${st.pending} in flight)\n` +
+    `${w.settlements.length} places: ${c[2]} cities, ${c[1]} towns, ${c[0]} villages · ${laid} roads · ${st.regions} regions\n` +
+    `${S.agents.length} agents: ${modes.vehicle} vehicles · ${modes.boat} boats · ${modes.ped} hikers · ` +
+    `scale ${(M_PER_FINE*S.view.scale).toFixed(1)} m/px`;
+}
+
+//--------------------------------------------------------------------------
+// Boot
+//--------------------------------------------------------------------------
 const urlSeed = new URLSearchParams(location.search).get('seed');
 if(urlSeed) $('seed').value = urlSeed;
-fit(); regenerate(); requestAnimationFrame(loop);
+initWorld(readParams());
+requestAnimationFrame(loop);
 window.__S = S;   // debug/inspection handle

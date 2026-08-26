@@ -1,12 +1,12 @@
-// Runtime agents in three movement modes:
-//   vehicles — route over the coarse road-junction graph (Dijkstra),
+// Runtime agents in three movement modes, maintained around the viewport:
+//   vehicles — route over the road-junction graph (Dijkstra),
 //   boats    — route between ports over the water-lane graph,
 //   hikers   — STAGED trips along feeder roads only: they walk to a nearby
 //              pickup settlement, ride a vehicle over the road network, then
-//              walk the last leg to their destination. Close villages are
-//              sometimes walked directly. Walkers never use trunk highways,
-//              never cut cross-country, and get a sidewalk offset so they
-//              stay clear of both the roadway and building lots.
+//              walk the last leg to their destination.
+// In an infinite world there is no fixed population to simulate: agents are
+// spawned just outside the view, despawned when they fall far behind it, and
+// finished trips simply retire (the maintainer respawns fresh ones nearby).
 // All modes share waypoint machinery: cell paths rasterized into fine world
 // points, walked stage by stage at kind-dependent speed.
 
@@ -43,8 +43,8 @@ function cellPathFor(graph, seq){
   return cells;
 }
 
-const ptsFromCells = cells => cells.map(ci =>
-  [((ci%S.GW)+0.5)*COARSE_SCALE, ((ci/S.GW|0)+0.5)*COARSE_SCALE]);
+const ptsFromCells = cells => cells.map(([gx,gy]) =>
+  [(gx+0.5)*COARSE_SCALE, (gy+0.5)*COARSE_SCALE]);
 
 // Road-centerline cells -> sidewalk points: shift every vertex onto one side
 // of the road (perpendicular to local travel direction). The offset clears the
@@ -60,7 +60,7 @@ function sidewalkPts(cells, side){
   });
 }
 
-// Reachable settlements from src over `graph`, as [node,dist] sorted near->far.
+// Reachable nodes from src over `graph`, as [node,dist] sorted near->far.
 function reachable(graph, src){
   const { adj } = graph; if(!adj) return [];
   const dist = new Map([[src,0]]), pq = [[0,src]];
@@ -83,14 +83,16 @@ function makeStage(kind, pts, base){
 
 // A pedestrian trip: O --walk(feeder)--> T1 ==ride(roads)==> T2 --walk(feeder)--> D,
 // or a direct walk when origin and destination are close feeder neighbors.
-function newTrip(){
+// Confined to settlements near the viewport (`pool` of registry indexes).
+function newTrip(pool){
   const fg = S.world.feederGraph, rg = S.world.roadGraph;
   if(!fg || !fg.nEdges || !rg || rg.nodes.length<2) return null;
   const st = S.world.settlements;
+  if(!pool.length) return null;
   const base = agentRand();
   for(let tries=0; tries<8; tries++){
-    const O=(agentRand()*st.length)|0, D=(agentRand()*st.length)|0;
-    if(O===D) continue;
+    const O=pool[(agentRand()*pool.length)|0], D=pool[(agentRand()*pool.length)|0];
+    if(O===D || !st[O]) continue;
     const stages = [];
     const side = agentRand()<0.5 ? -1 : 1;
 
@@ -123,11 +125,12 @@ function newTrip(){
   return null;
 }
 
-// graph-routed trip between two random nodes of the road or water network
-function newGraphAgent(graph, mode){
-  const nodes = graph.nodes; const N = nodes.length; if(N<2) return null;
-  let from=(agentRand()*N)|0, to=(agentRand()*N)|0, tr=0;
-  while(to===from && tr++<10) to=(agentRand()*N)|0;
+// graph-routed trip between two random nodes of the road/water network that
+// both sit near the viewport (`pool` of node indexes into graph.nodes)
+function newGraphAgent(graph, mode, pool){
+  const nodes = graph.nodes; if(!pool.length) return null;
+  let from=pool[(agentRand()*pool.length)|0], to=pool[(agentRand()*pool.length)|0], tr=0;
+  while(to===from && tr++<10) to=pool[(agentRand()*pool.length)|0];
   const cells = cellPathFor(graph, dijkstraRoute(graph, from, to));
   if(!cells||cells.length<2) return null;
   return { mode, stages:[makeStage(mode, ptsFromCells(cells), agentRand())],
@@ -137,26 +140,64 @@ function newGraphAgent(graph, mode){
     carColor:'#888' };
 }
 
-export function spawnAgents(){
-  S.agents = [];
-  const fill = (have, target, make)=>{
-    let guard=0;
-    while(S.agents.length < have+target && guard++<target*5){
-      const a=make(); if(a) S.agents.push(a);
+// Random node/settlement indexes inside a coarse rect (random probes — the
+// registries are append-only and unsorted, so probing beats filtering).
+function probePool(count, total, inRect){
+  const pool = [];
+  for(let t=0;t<count && pool.length<40;t++){
+    const i=(agentRand()*total)|0;
+    if(inRect(i)) pool.push(i);
+  }
+  return pool;
+}
+
+let maintTimer = 0;
+
+// Spawn missing agents near the view and drop those far behind it.
+export function maintainAgents(dt, rx0, ry0, rx1, ry1){
+  maintTimer -= dt;
+  const wSpan = rx1-rx0, hSpan = ry1-ry0;
+  // spawn ring: just outside the view
+  const mx = wSpan*0.25, my = hSpan*0.25;
+  // despawn ring: well behind it (agents finishing trips out there retire)
+  const ex0=rx0-wSpan*0.75, ex1=rx1+wSpan*0.75, ey0=ry0-hSpan*0.75, ey1=ry1+hSpan*0.75;
+  const inRect = (x,y) => x>=rx0-mx && x<=rx1+mx && y>=ry0-my && y<=ry1+my;
+
+  for(let i=S.agents.length-1;i>=0;i--){
+    const a=S.agents[i];
+    const st=a.stages[a.si], n=st.pts.length;
+    const p=st.pts[Math.max(0,Math.min(n-1,Math.floor(a.t)))];
+    if(!p || p[0]<ex0 || p[0]>ex1 || p[1]<ey0 || p[1]>ey1){
+      S.agents[i]=S.agents[S.agents.length-1]; S.agents.pop();
     }
-    return S.agents.length;
+  }
+
+  if(maintTimer > 0) return;
+  maintTimer = 0.8;
+  const w = S.world; if(!w) return;
+
+  const nodeInRect = g => i => {
+    const n=g.nodes[i]; return n && inRect((n.cx+0.5)*COARSE_SCALE,(n.cy+0.5)*COARSE_SCALE);
   };
-  let n = 0;
-  // vehicles
-  if(S.world.roadGraph && S.world.roadGraph.nodes.length>=2)
-    n = fill(n, Math.min(120, Math.max(10, S.world.roads.edges.length)),
-             ()=>newGraphAgent(S.world.roadGraph,'vehicle'));
-  // boats
-  if(S.world.waterGraph && S.world.waterGraph.lanes.length>=1)
-    n = fill(n, Math.min(60, Math.max(6, S.world.waterGraph.lanes.length*1.2)),
-             ()=>newGraphAgent(S.world.waterGraph,'boat'));
-  // hikers (feeder-road walkers with vehicle legs)
-  fill(n, Math.min(90, Math.max(10, (S.world.settlements.length/4)|0)), newTrip);
+  const targets = [
+    ['vehicle', Math.min(80, Math.max(8, w.roads.edges.length/3|0)),
+     () => newGraphAgent(w.roadGraph,'vehicle',
+           probePool(30, w.roadGraph.nodes.length, nodeInRect(w.roadGraph)))],
+    ['boat', Math.min(36, Math.max(4, w.waterGraph.lanes.length*0.8|0)),
+     () => newGraphAgent(w.waterGraph,'boat',
+           probePool(30, w.waterGraph.nodes.length, nodeInRect(w.waterGraph)))],
+    ['ped', Math.min(60, Math.max(6, w.settlements.length/4|0)),
+     () => newTrip(probePool(30, w.settlements.length,
+            i => { const s=w.settlements[i]; return s && inRect(s.x,s.y); }))],
+  ];
+  for(const [mode, target, make] of targets){
+    let have = S.agents.filter(a=>a.mode===mode).length;
+    let guard = 12;
+    while(have < target && guard-- > 0){
+      const a = make();
+      if(a){ S.agents.push(a); have++; }
+    }
+  }
 }
 
 export function stepAgents(dt){
@@ -165,14 +206,11 @@ export function stepAgents(dt){
     a.t += st.speed*dt/COARSE_SCALE;
     if(a.t >= st.pts.length-1){
       if(a.si < a.stages.length-1){ a.si++; a.t=0; }
-      else {
-        const na = a.mode==='vehicle' ? newGraphAgent(S.world.roadGraph,'vehicle')
-                 : a.mode==='boat' ? newGraphAgent(S.world.waterGraph,'boat')
-                 : newTrip();
-        if(na) Object.assign(a,na); else { a.si=0; a.t=0; }
-      }
+      else a.retired = true;   // maintainer will replace it near the viewport
     }
   }
+  for(let i=S.agents.length-1;i>=0;i--)
+    if(S.agents[i].retired){ S.agents[i]=S.agents[S.agents.length-1]; S.agents.pop(); }
 }
 
 const curPts = a => a.stages[a.si].pts;
