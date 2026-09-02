@@ -1,4 +1,4 @@
-# Westeros — Self-Generating 2D World
+# Westeros - Self-Generating 2D World
 
 A procedurally generated, navigable 2D map rendered on the HTML Canvas API.
 Inspired by Juraj Majerik's grid-based map ([draw-map](https://jurajmajerik.com/blog/draw-map/)),
