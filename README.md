@@ -5,7 +5,7 @@ Inspired by Juraj Majerik's grid-based map ([draw-map](https://jurajmajerik.com/
 extended from hand-placed obstacles into a fully procedural world covering all
 natural terrain and human activity.
 
-![Westeros World Map](image.png)
+![Westeros World Map](./src/westeros.png)
 
 ## Goal
 A virtual world of purely 2D navigable maps covering:
