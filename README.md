@@ -5,6 +5,8 @@ Inspired by Juraj Majerik's grid-based map ([draw-map](https://jurajmajerik.com/
 extended from hand-placed obstacles into a fully procedural world covering all
 natural terrain and human activity.
 
+![Westeros World Map](image.png)
+
 ## Goal
 A virtual world of purely 2D navigable maps covering:
 a. Forest cover · b. Mountains · c. Rivers, swamps & bogs · d. Lakes ·
